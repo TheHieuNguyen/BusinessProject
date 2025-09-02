@@ -1,0 +1,639 @@
+# DATA CLEANING for Main datasets 
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
+from statsmodels.tsa.stattools import grangercausalitytests
+from scipy.stats import ttest_1samp
+import re
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from statsmodels.tsa.stattools import grangercausalitytests
+from scipy.stats import gaussian_kde, t
+
+# Load datasets correctly
+df1 = pd.read_csv(r'C:\Users\Admin\Downloads\stock_tweets.csv')  # tweets data
+df2 = pd.read_csv(r'C:\Users\Admin\Downloads\Stock Yahoo.csv')   # stock price data
+
+# Convert date columns
+df1['Date'] = pd.to_datetime(df1['Date'], errors='coerce')
+df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce')
+
+# Define tweet cleaning function
+def clean_tweet(text):
+    text = re.sub(r"http\S+|www\S+|https\S+", '', text, flags=re.MULTILINE)  # remove URLs
+    text = re.sub(r'@\w+', '', text)  # remove mentions
+    text = re.sub(r'#\w+', '', text)  # remove hashtags
+    text = re.sub(r'[^A-Za-z0-9\s,.!?\'\"]+', '', text)  # remove special chars except punctuation
+    return text.strip()
+
+# Clean tweets
+df1['Clean_Tweet'] = df1['Tweet'].apply(clean_tweet)
+
+##########################################################################################################################################
+# DATA CLEANING for Training dataset
+
+# Load training data
+train_df = pd.read_csv(r'C:\Users\Admin\Downloads\sent_train.csv')
+
+# Fill missing texts with empty strings
+train_df['text'] = train_df['text'].fillna('')
+
+# Define cleaning function similar to raw tweets cleaning
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+|https\S+", '', text)  # remove URLs
+    text = re.sub(r'@\w+', '', text)                      # remove mentions
+    text = re.sub(r'#\w+', '', text)                      # remove hashtags
+    text = re.sub(r'[^a-z0-9\s,.!?\'\"]+', '', text)     # remove special chars except punctuation
+    text = re.sub(r'\s+', ' ', text).strip()              # remove extra whitespace
+    return text
+
+# Apply cleaning
+train_df['Clean_Text'] = train_df['text'].apply(clean_text)
+
+# Remove duplicates
+train_df = train_df.drop_duplicates(subset=['Clean_Text'])
+
+# Preview cleaned data
+print(train_df[['text', 'Clean_Text', 'label']].head())
+
+#######################################################################################################################################
+# Audit the label quality by Activity sampling
+
+import random
+
+sample_size = 100
+sample_indices = random.sample(range(len(train_df)), sample_size)
+sample_tweets = train_df.iloc[sample_indices][['Clean_Text', 'label']]
+
+print(sample_tweets)
+# Export sample to Excel or CSV for manual checking
+sample_tweets.to_csv('sample_for_label_check.csv', index=False)
+
+########################################################################################################################################
+
+# === 1) Train sentiment classifier ===
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+import numpy as np
+
+# Use your cleaned training text
+X = train_df['Clean_Text'].astype(str)
+y = train_df['label'].astype(int)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+vec = TfidfVectorizer(max_features=5000, stop_words='english', ngram_range=(1,2), min_df=3)
+X_train_vec = vec.fit_transform(X_train)
+X_test_vec  = vec.transform(X_test)
+
+clf = LogisticRegression(max_iter=1000, class_weight='balanced', n_jobs=1)
+clf.fit(X_train_vec, y_train)
+
+print("Validation report (train_df → sentiment):")
+print(classification_report(y_test, clf.predict(X_test_vec), digits=3))
+print("Confusion matrix:\n", confusion_matrix(y_test, clf.predict(X_test_vec)))
+print("Classes learned:", clf.classes_)
+
+########################################################################################################################################
+# === 2) Apply model to tweets ===
+# ensure Clean_Tweet exists from your cleaning cell
+X_tw = vec.transform(df1['Clean_Tweet'].astype(str))
+pred_class = clf.predict(X_tw)  # 0/1/2 (e.g., Negative/Neutral/Positive)
+df1['Predicted_Sentiment'] = pred_class
+df1['Sentiment_Score'] = df1['Predicted_Sentiment'].map({0:-1, 1:0, 2:1})
+
+# quick sanity check
+print(df1[['Stock Name','Date','Sentiment_Score']].head())
+
+########################################################################################################################################
+# === 3) Daily aggregation + Surprise index ===
+
+df1['DateOnly'] = pd.to_datetime(df1['Date']).dt.date
+daily = (df1.groupby(['Stock Name','DateOnly'])
+            .agg(tw_count=('Sentiment_Score','size'),
+                 sent_mean=('Sentiment_Score','mean'))
+            .reset_index()
+            .sort_values(['Stock Name','DateOnly']))
+
+# rolling z-scores (data-driven surprise)
+def add_roll_z(df, group_col, val_col, win=30, minp=10):
+    m = df.groupby(group_col)[val_col].transform(lambda s: s.rolling(win, min_periods=minp).mean())
+    s = df.groupby(group_col)[val_col].transform(lambda s: s.rolling(win, min_periods=minp).std())
+    return (df[val_col]-m)/s
+
+daily['z_vol']  = add_roll_z(daily, 'Stock Name', 'tw_count')
+daily['z_sent'] = add_roll_z(daily, 'Stock Name', 'sent_mean')
+daily['Surprise_Day'] = ((daily['z_vol'] >= 2) | (daily['z_sent'].abs() >= 2)).astype(int)
+
+# top-5 by total tweet volume across period
+top5 = (daily.groupby('Stock Name')['tw_count'].sum().sort_values(ascending=False).head(5).index.tolist())
+print("Top-5 most tweeted stocks:", top5)
+
+########################################################################################################################################
+# === 4) Merge with prices ===
+df2['DateOnly'] = pd.to_datetime(df2['Date']).dt.date
+
+# pick a close column
+close_col = None
+for c in ['Adj Close','Adj_Close','Close','close']:
+    if c in df2.columns:
+        close_col = c; break
+if close_col is None:
+    for c in df2.columns:
+        if 'Close' in c:
+            close_col = c; break
+if close_col is None:
+    raise ValueError("No Close/Adj Close column found in df2.")
+
+df2 = df2.sort_values(['Stock Name','DateOnly'])
+df2['Daily_Return'] = df2.groupby('Stock Name')[close_col].pct_change()
+
+merged = (df2[['Stock Name','DateOnly','Daily_Return']]
+          .merge(daily[['Stock Name','DateOnly','sent_mean','tw_count','Surprise_Day']],
+                 on=['Stock Name','DateOnly'], how='inner')
+          .rename(columns={'Stock Name':'Stock'})
+          .sort_values(['Stock','DateOnly']))
+
+merged_top5 = merged[merged['Stock'].isin(top5)].copy()
+print(merged_top5.head())
+
+########################################################################################################################################
+# Tweets descriptive stats
+print("Tweets per stock:")
+print(df1['Stock Name'].value_counts())
+
+print("\nSentiment score statistics overall:")
+print(df1['Sentiment_Score'].describe())
+
+print("\nSentiment score stats per stock:")
+print(df1.groupby('Stock Name')['Sentiment_Score'].describe())
+
+print("\nTweet counts by predicted sentiment class:")
+print(df1['Predicted_Sentiment'].value_counts())
+
+# Time series tweet volume (monthly)
+tweet_volume_time = df1.groupby(df1['Date'].dt.to_period('M')).size()
+print("\nTweet volume over time (monthly):")
+print(tweet_volume_time)
+
+# Stock price descriptive stats
+print("\nStock daily returns stats per stock:")
+print(df2.groupby('Stock Name')['Daily_Return'].describe())
+
+print("\nStock trading volume stats per stock:")
+print(df2.groupby('Stock Name')['Volume'].describe())
+
+print("\nStock data date range:")
+print(f"{df2['Date'].min()} to {df2['Date'].max()}")
+########################################################################################################################################
+# 0) Build the daily panel
+# --------------------------
+assert 'Stock Name' in df1.columns, "df1 must include 'Stock Name'"
+assert 'Date' in df1.columns and 'Date' in df2.columns, "Both df1 & df2 need 'Date'"
+
+# Dates → DateOnly
+df1['Date'] = pd.to_datetime(df1['Date'], errors='coerce')
+df2['Date'] = pd.to_datetime(df2['Date'], errors='coerce')
+df1 = df1.dropna(subset=['Date'])
+df2 = df2.dropna(subset=['Date'])
+df1['DateOnly'] = df1['Date'].dt.date
+df2['DateOnly'] = df2['Date'].dt.date
+
+# Ensure sentiment score (map from predicted labels if needed)
+if 'Sentiment_Score' not in df1.columns:
+    if 'Predicted_Sentiment' in df1.columns:
+        df1['Sentiment_Score'] = df1['Predicted_Sentiment'].map({0:-1,1:0,2:1})
+    else:
+        raise ValueError("Provide df1['Sentiment_Score'] or df1['Predicted_Sentiment'].")
+
+# Daily tweet aggregation
+daily = (df1.groupby(['Stock Name','DateOnly'])
+           .agg(tw_count=('Sentiment_Score','size'),
+                sent_mean=('Sentiment_Score','mean'))
+           .reset_index()
+           .sort_values(['Stock Name','DateOnly']))
+
+# Choose a Close column
+close_col = None
+for c in ['Adj Close','Adj_Close','Close','close']:
+    if c in df2.columns:
+        close_col = c; break
+if close_col is None:
+    for c in df2.columns:
+        if 'Close' in c:
+            close_col = c; break
+if close_col is None:
+    raise ValueError("No Close/Adj Close column found in df2.")
+
+# Daily returns
+df2 = df2.sort_values(['Stock Name','DateOnly'])
+df2['Daily_Return'] = df2.groupby('Stock Name')[close_col].pct_change()
+
+# Merge tweets ↔ returns (inner by day)
+merged = (df2[['Stock Name','DateOnly','Daily_Return']]
+          .merge(daily, on=['Stock Name','DateOnly'], how='inner')
+          .rename(columns={'Stock Name':'Stock'})
+          .sort_values(['Stock','DateOnly']))
+
+# Top-5 by total tweet count
+top5 = (daily.groupby('Stock Name')['tw_count']
+              .sum().sort_values(ascending=False).head(5).index.tolist())
+merged_top5 = merged[merged['Stock'].isin(top5)].copy()
+
+# Output folder
+os.makedirs("figs", exist_ok=True)
+def savefig(name):
+    path = os.path.join("figs", name)
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    print(f"Saved: {path}")
+
+# --------------------------
+# Helpers
+# --------------------------
+def hac_ols(y, x, maxlags=5):
+    df = pd.DataFrame({'y':y, 'x':x}).dropna()
+    if len(df) < 10: return np.nan, np.nan, np.nan, np.nan
+    X = sm.add_constant(df['x'])
+    m = sm.OLS(df['y'], X).fit(cov_type='HAC', cov_kwds={'maxlags':maxlags})
+    return m.params.get('x',np.nan), m.bse.get('x',np.nan), m.pvalues.get('x',np.nan), m.rsquared
+
+def panel_layout(n_panels, ncols=3):
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6*ncols, 4.2*nrows))
+    axes = np.atleast_2d(axes).ravel()
+    return fig, axes, nrows, ncols
+
+def add_rolling_z(df, group, col, win=30, minp=15):
+    df = df.copy()
+    mu = df.groupby(group)[col].transform(lambda s: s.rolling(win, min_periods=minp).mean())
+    sd = df.groupby(group)[col].transform(lambda s: s.rolling(win, min_periods=minp).std())
+    return (df[col]-mu)/sd
+
+# equal-weight “market” return (for event study)
+mrk = (merged.groupby('DateOnly')['Daily_Return']
+              .mean().rename('MktRet').reset_index())
+
+def event_cars(stock, z_thresh=2.0, pre_win=60, gap=5):
+    sub = merged_top5[merged_top5['Stock']==stock].sort_values('DateOnly').copy()
+    sub['z_vol']  = add_rolling_z(sub, 'Stock', 'tw_count')
+    sub['z_sent'] = add_rolling_z(sub, 'Stock', 'sent_mean')
+    sub = sub.merge(mrk, on='DateOnly', how='left').dropna(subset=['Daily_Return','MktRet'])
+    idx = np.where(((sub['z_vol']>=z_thresh) | (sub['z_sent'].abs()>=z_thresh)).values)[0]
+    car01, car02 = [], []
+    for t0 in idx:
+        t_est_start, t_est_end = t0 - (gap+pre_win), t0 - (gap+1)
+        t1, t2 = t0+1, t0+2
+        if t_est_start < 0 or t2 >= len(sub): 
+            continue
+        est = sub.iloc[t_est_start:t_est_end+1]
+        if len(est) < 20: 
+            continue
+        X = sm.add_constant(est['MktRet'].values); y = est['Daily_Return'].values
+        mm = sm.OLS(y, X).fit()
+        need = sub.iloc[[t0,t1,t2]][['MktRet','Daily_Return']]
+        Xp = sm.add_constant(need['MktRet'].values)
+        pred = mm.predict(Xp)
+        ar = need['Daily_Return'].values - pred
+        car01.append(ar[0]+ar[1])
+        car02.append(ar[0]+ar[1]+ar[2])
+    return np.array(car01), np.array(car02)
+
+def oos_eval(stock, train_n=175):
+    sub = merged_top5[merged_top5['Stock']==stock][['DateOnly','Daily_Return','sent_mean']].dropna()
+    sub = sub.sort_values('DateOnly').reset_index(drop=True)
+    if len(sub) < train_n + 10: return None
+    sub['ret_t1'] = sub['Daily_Return'].shift(-1)
+    sub['ret_t']  = sub['Daily_Return']
+    sub['sent_t'] = sub['sent_mean']
+    sub = sub.dropna().reset_index(drop=True)
+    if len(sub) < train_n + 5: return None
+    train = sub.iloc[:train_n].copy(); test = sub.iloc[train_n:].copy()
+
+    # Baseline AR(1)
+    Xb_tr = sm.add_constant(train[['ret_t']]); y_tr = train['ret_t1']
+    Xb_te = sm.add_constant(test[['ret_t']]);  y_te = test['ret_t1']
+    m_b   = sm.OLS(y_tr, Xb_tr).fit()
+    pred_b = m_b.predict(Xb_te)
+
+    # Choose best lag of sentiment L∈{0,1,2,3} on train
+    best_lag, best_mse = 0, np.inf
+    for L in [0,1,2,3]:
+        tr = train.copy(); tr['sent_l'] = tr['sent_t'].shift(L); tr = tr.dropna()
+        if len(tr) < train_n-5: continue
+        X_tr = sm.add_constant(tr[['ret_t','sent_l']]); y_tr2 = tr['ret_t1']
+        m = sm.OLS(y_tr2, X_tr).fit()
+        mse = float(np.mean(m.resid**2))
+        if mse < best_mse: best_mse, best_lag = mse, L
+
+    # Refit augmented
+    tr = train.copy(); tr['sent_l'] = tr['sent_t'].shift(best_lag); tr = tr.dropna()
+    X_tr = sm.add_constant(tr[['ret_t','sent_l']]); y_tr2 = tr['ret_t1']
+    m_a = sm.OLS(y_tr2, X_tr).fit()
+
+    # Apply to aligned test
+    te = test.copy(); te['sent_l'] = te['sent_t'].shift(best_lag); te = te.dropna()
+    Xb_te_al = Xb_te.loc[te.index]; y_te_al = y_te.loc[te.index]
+    Xa_te = sm.add_constant(te[['ret_t','sent_l']])
+    pred_a = m_a.predict(Xa_te)
+
+    ybar_tr = float(y_tr.mean())
+    ss_res_b = float(np.sum((y_te_al - pred_b.loc[te.index])**2))
+    ss_res_a = float(np.sum((y_te_al - pred_a)**2))
+    ss_tot   = float(np.sum((y_te_al - ybar_tr)**2))
+    return {
+        'Stock':stock,
+        'OOS_R2_AR1': 1 - ss_res_b/ss_tot,
+        'OOS_R2_AR1_Sent': 1 - ss_res_a/ss_tot,
+        'MAE_AR1': float(np.mean(np.abs(y_te_al - pred_b.loc[te.index]))),
+        'MAE_AR1_Sent': float(np.mean(np.abs(y_te_al - pred_a)))
+    }
+
+# =============================================================
+# PANEL 3.1 — Top-5 tweet counts (bar)
+# =============================================================
+plt.figure(figsize=(8,5))
+counts = (df1.groupby('Stock Name')['Sentiment_Score']
+            .count().sort_values(ascending=False).head(5))
+plt.bar(counts.index, counts.values)
+plt.title("Top-5 Stocks by Total Tweets")
+plt.xlabel("Stock"); plt.ylabel("Tweet count")
+savefig("Panel_3_1_Top5_TweetCounts.png")
+plt.show()
+
+# =============================================================
+# Overall percentage bar chart of tweet sentiment
+# =============================================================
+# 1) Pick the sentiment column and map to labels
+if 'Predicted_Sentiment' in df1.columns:          # 0/1/2
+    sent_labels = df1['Predicted_Sentiment'].map({0:'Negative', 1:'Neutral', 2:'Positive'})
+elif 'Sentiment_Score' in df1.columns:            # -1/0/+1
+    sent_labels = df1['Sentiment_Score'].map({-1:'Negative', 0:'Neutral', 1:'Positive'})
+else:
+    raise ValueError("No sentiment column found. Expected 'Predicted_Sentiment' or 'Sentiment_Score'.")
+
+# 2) Counts and percentages
+counts = (sent_labels
+          .value_counts()
+          .reindex(['Negative', 'Neutral', 'Positive'])
+          .fillna(0)
+          .astype(int))
+pct = (counts / counts.sum() * 100)
+
+# 3) Plot
+fig, ax = plt.subplots(figsize=(6,4))
+bars = ax.bar(pct.index, pct.values)
+ax.set_ylim(0, 100)
+ax.set_ylabel('Percentage of tweets (%)')
+ax.set_title('Overall Tweet Sentiment Mix')
+
+# value labels on top of bars
+for b, val in zip(bars, pct.values):
+    ax.text(b.get_x() + b.get_width()/2, b.get_height() + 1,
+            f'{val:.1f}%', ha='center', va='bottom', fontsize=10)
+
+plt.tight_layout()
+plt.savefig('fig_sentiment_share_overall.png', dpi=300)
+plt.show()
+
+# =============================================================
+#  Same-day Sentiment vs Return (hexbin + OLS + LOWESS)
+# =============================================================
+fig, axes, nrows, ncols = panel_layout(len(top5), ncols=3)
+fig.suptitle("Same-day Sentiment vs Return (Top-5): Hexbin + OLS + LOWESS", y=0.98)
+
+for i, stock in enumerate(top5):
+    ax = axes[i]
+    sub = merged_top5[merged_top5['Stock']==stock].dropna(subset=['Daily_Return','sent_mean'])
+    if sub.empty: ax.set_visible(False); continue
+    x = sub['sent_mean'].values
+    y = sub['Daily_Return'].values
+
+    hb = ax.hexbin(x, y, gridsize=35, mincnt=1)
+    X = sm.add_constant(x)
+    ols = sm.OLS(y, X).fit()
+    xline = np.linspace(x.min(), x.max(), 120)
+    yline = ols.params[0] + ols.params[1]*xline
+    ax.plot(xline, yline, linewidth=2)
+
+    lo = lowess(y, x, frac=0.6, return_sorted=True)
+    ax.plot(lo[:,0], lo[:,1])
+
+    b,se,p,r2 = hac_ols(sub['Daily_Return'], sub['sent_mean'], maxlags=5)
+    ax.set_title(f"{stock}  β={b:.4f}, R²={r2:.3f}, p={p:.3f}")
+    if i % ncols == 0: ax.set_ylabel("Daily return")
+    ax.set_xlabel("Avg daily sentiment")
+
+for j in range(len(top5), len(axes)): axes[j].set_visible(False)
+savefig("Panel_5_1_SameDay_Hexbin_OLS_LOWESS_Top5.png")
+plt.show()
+
+# =============================================================
+# Same-day OLS coefficients (HAC 95% CI)
+# =============================================================
+rows = []
+for stock in top5:
+    sub = merged_top5[merged_top5['Stock']==stock]
+    b,se,p,r2 = hac_ols(sub['Daily_Return'], sub['sent_mean'], maxlags=5)
+    rows.append({'Stock':stock,'beta':b,'se':se,'p':p,'R2':r2})
+coef_df = pd.DataFrame(rows).dropna()
+
+plt.figure(figsize=(8,5))
+ypos = np.arange(len(coef_df))
+plt.errorbar(coef_df['beta'], ypos, xerr=1.96*coef_df['se'], fmt='o', capsize=3)
+plt.yticks(ypos, coef_df['Stock'])
+plt.axvline(0, linestyle='--')
+plt.title("Same-day Coefficients (HAC 95% CI)")
+plt.xlabel("Coefficient on sentiment_t")
+savefig("Panel_5_2_SameDay_Coef_CI_Top5.png")
+plt.show()
+
+# =============================================================
+# Lag coefficients β_L (manual stems + HAC CI, FDR)
+# =============================================================
+def lag_coefs(stock, Lmax=14, maxlags_hac=5):
+    sub = merged_top5[merged_top5['Stock']==stock].dropna(subset=['Daily_Return','sent_mean'])
+    B, SE, P = [], [], []
+    for L in range(1, Lmax+1):
+        b,se,p,_ = hac_ols(sub['Daily_Return'].shift(-L), sub['sent_mean'], maxlags=maxlags_hac)
+        B.append(b); SE.append(se); P.append(p)
+    P = np.array([p if pd.notna(p) else 1.0 for p in P])
+    rej, p_adj, _, _ = multipletests(P, alpha=0.05, method='fdr_bh')
+    return np.arange(1,Lmax+1), np.array(B), np.array(SE), rej
+
+fig, axes, nrows, ncols = panel_layout(len(top5), ncols=3)
+fig.suptitle("Lag Coefficients: return$_{t+L}$ on sentiment$_t$ (FDR-marked)", y=0.98)
+
+for i, stock in enumerate(top5):
+    ax = axes[i]
+    L, B, SE, REJ = lag_coefs(stock, Lmax=14, maxlags_hac=5)
+
+    # --- manual "stem" to avoid ax.stem() version issues ---
+    for l, b in zip(L, B):
+        if np.isnan(b): 
+            continue
+        ax.vlines(l, 0, b, linewidth=1)
+        ax.plot(l, b, marker='o', markersize=3)
+
+    # 95% HAC CI band
+    ci_lo = B - 1.96*SE
+    ci_hi = B + 1.96*SE
+    ax.fill_between(L, ci_lo, ci_hi, alpha=0.2)
+
+    # mark FDR-significant lags
+    sigL = L[REJ]; sigB = B[REJ]
+    ax.scatter(sigL, sigB, s=80)
+
+    ax.axhline(0, linestyle='--')
+    ax.set_title(stock)
+    if i % ncols == 0: ax.set_ylabel("β_L")
+    ax.set_xlabel("Lag L (days)")
+
+# hide any unused axes
+for j in range(len(top5), len(axes)): 
+    axes[j].set_visible(False)
+
+savefig("Panel_5_3_Lag_Stem_CI_FDR_Top5.png")
+plt.show()
+# =============================================================
+# Granger p-values heatmap (stocks × lags)
+# =============================================================
+maxlag = 5
+lag_idx = np.arange(1, maxlag+1)
+pv_mat, labels = [], []
+for stock in top5:
+    sub = merged_top5[merged_top5['Stock']==stock][['DateOnly','Daily_Return','sent_mean']].dropna().sort_values('DateOnly')
+    if len(sub) < maxlag + 10:
+        pvs = np.full(maxlag, np.nan)
+    else:
+        mat = pd.DataFrame({'ret':sub['Daily_Return'].values,
+                            'sent':sub['sent_mean'].values})[['ret','sent']].values
+        try:
+            res = grangercausalitytests(mat, maxlag=maxlag, verbose=False)
+            pvs = np.array([res[L][0]['ssr_ftest'][1] for L in lag_idx])
+        except Exception:
+            pvs = np.full(maxlag, np.nan)
+    pv_mat.append(pvs); labels.append(stock)
+
+pv_mat = np.array(pv_mat)
+plt.figure(figsize=(8,4.8))
+im = plt.imshow(pv_mat, aspect='auto', origin='upper', vmin=0, vmax=1)
+plt.colorbar(im, fraction=0.046, pad=0.04, label='p-value')
+plt.yticks(np.arange(len(labels)), labels)
+plt.xticks(np.arange(maxlag), lag_idx)
+plt.title("Granger p-values (sentiment → returns)")
+plt.xlabel("Lag"); plt.ylabel("Stock")
+for i in range(pv_mat.shape[0]):
+    for j in range(pv_mat.shape[1]):
+        if not np.isnan(pv_mat[i,j]) and pv_mat[i,j] < 0.05:
+            plt.scatter(j, i, s=60, marker='x')
+savefig("Panel_5_4_Granger_Heatmap_Top5.png")
+plt.show()
+
+# =============================================================
+# Event CAR distributions + mean & 95% CI
+# =============================================================
+fig, axes, nrows, ncols = panel_layout(len(top5), ncols=3)
+fig.suptitle("Event-style CAR Distributions around Tweet-Volume Peaks", y=0.98)
+
+for i, stock in enumerate(top5):
+    ax = axes[i]
+    c01, c02 = event_cars(stock, z_thresh=2.0, pre_win=60, gap=5)
+    x1 = np.full_like(c01, 0.9, dtype=float) + (np.random.rand(len(c01))-0.5)*0.1
+    x2 = np.full_like(c02, 1.9, dtype=float) + (np.random.rand(len(c02))-0.5)*0.1
+    if len(c01)>0: ax.scatter(x1, c01, alpha=0.7)
+    if len(c02)>0: ax.scatter(x2, c02, alpha=0.7)
+    def mean_ci(a):
+        a = np.asarray(a); a = a[~np.isnan(a)]
+        if len(a)==0: return np.nan, np.nan, np.nan
+        m = float(np.mean(a)); s = float(np.std(a, ddof=1)); n = len(a)
+        if n<=1: return m, m, m
+        tval = t.ppf(0.975, n-1)
+        lo = m - tval*s/np.sqrt(n); hi = m + tval*s/np.sqrt(n)
+        return m, lo, hi
+    m1, lo1, hi1 = mean_ci(c01); m2, lo2, hi2 = mean_ci(c02)
+    if not np.isnan(m1):
+        ax.plot([0.8,1.0], [m1,m1], linewidth=3)
+        ax.vlines(0.9, lo1, hi1, linewidth=2)
+    if not np.isnan(m2):
+        ax.plot([1.8,2.0], [m2,m2], linewidth=3)
+        ax.vlines(1.9, lo2, hi2, linewidth=2)
+    ax.axhline(0, linestyle='--')
+    ax.set_xticks([0.9,1.9]); ax.set_xticklabels(["[0,1]","[0,2]"])
+    ax.set_title(f"{stock}  N₁={len(c01)}, N₂={len(c02)}")
+    if i % ncols == 0: ax.set_ylabel("CAR")
+    ax.set_xlabel("Window")
+
+for j in range(len(top5), len(axes)): axes[j].set_visible(False)
+savefig("Panel_5_5_Event_CAR_Distributions_Top5.png")
+plt.show()
+
+# =============================================================
+# OOS performance: slope charts (R² and MAE)
+# =============================================================
+oos_rows = []
+for s in top5:
+    r = oos_eval(s, train_n=175)
+    if r: oos_rows.append(r)
+oos = pd.DataFrame(oos_rows)
+
+# Slope chart: OOS R²
+plt.figure(figsize=(8,5))
+for _, r in oos.iterrows():
+    x = [0,1]; y = [r['OOS_R2_AR1'], r['OOS_R2_AR1_Sent']]
+    plt.plot(x, y, marker='o')
+    plt.text(-0.02, y[0], r['Stock'], ha='right', va='center')
+plt.xticks([0,1], ['AR(1)', 'AR(1)+Sent'])
+plt.ylabel("Out-of-sample $R^2$")
+plt.title("OOS $R^2$ Slope Chart (per stock)")
+savefig("Panel_5_6_OOS_R2_Slope.png")
+plt.show()
+
+# Slope chart: MAE (lower is better)
+plt.figure(figsize=(8,5))
+for _, r in oos.iterrows():
+    x = [0,1]; y = [r['MAE_AR1'], r['MAE_AR1_Sent']]
+    plt.plot(x, y, marker='o')
+    plt.text(-0.02, y[0], r['Stock'], ha='right', va='center')
+plt.xticks([0,1], ['AR(1)', 'AR(1)+Sent'])
+plt.ylabel("MAE (absolute daily return)")
+plt.title("Hold-out MAE Slope Chart (per stock)")
+savefig("Panel_5_6_MAE_Slope.png")
+plt.show()
+
+# --------------------------
+# Summary tables (print)
+# --------------------------
+print("Top-5 stocks used:", top5)
+
+# Same-day HAC summary
+rows = []
+for stock in top5:
+    sub = merged_top5[merged_top5['Stock']==stock]
+    b,se,p,r2 = hac_ols(sub['Daily_Return'], sub['sent_mean'], maxlags=5)
+    rows.append({'Stock':stock,'beta':b,'se':se,'p':p,'R2':r2,'N':int(sub['Daily_Return'].notna().sum())})
+same_day_summary = pd.DataFrame(rows)
+print("\nSame-day HAC OLS summary:\n", same_day_summary.round(6))
+
+# Event CAR summary
+car_rows = []
+for stock in top5:
+    c01, c02 = event_cars(stock, z_thresh=2.0, pre_win=60, gap=5)
+    def summarize(a):
+        if len(a)==0: return np.nan, np.nan, 0
+        return float(np.mean(a)), float(ttest_1samp(a, 0.0, nan_policy='omit').pvalue), int(len(a))
+    m1,p1,n1 = summarize(c01); m2,p2,n2 = summarize(c02)
+    car_rows.append({'Stock':stock,'N_[0,1]':n1,'CAR_[0,1]':m1,'p_[0,1]':p1,
+                              'N_[0,2]':n2,'CAR_[0,2]':m2,'p_[0,2]':p2})
+car_df = pd.DataFrame(car_rows)
+print("\nEvent CAR summary:\n", car_df.round(6))
+
+# OOS summary
+print("\nOOS summary:\n", oos.round(6))
