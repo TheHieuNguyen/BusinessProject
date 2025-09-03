@@ -436,6 +436,137 @@ savefig("Panel_5_1_SameDay_Hexbin_OLS_LOWESS_Top5.png")
 plt.show()
 
 # =============================================================
+# =============================================================
+# RQ2 — L=1 next-day coefficient WITH CONTROLS (return_t, market_t)
+# =============================================================
+def l1_with_controls(stock, hac_lags=5):
+    sub = merged[merged['Stock']==stock].copy().sort_values('DateOnly')
+    if sub.empty:
+        return {'Stock':stock, 'beta':np.nan, 'se':np.nan, 'p':np.nan, 'N':0}
+    # equal-weight "market" return across covered names (same-day)
+    mrk = merged.groupby('DateOnly')['Daily_Return'].mean().rename('MktRet')
+    sub = sub.merge(mrk, on='DateOnly', how='left')
+
+    sub['ret_t1'] = sub['Daily_Return'].shift(-1)  # target: next-day return
+    sub['sent_t'] = sub['sent_mean']               # predictor: today's sentiment
+    sub = sub.dropna(subset=['ret_t1','Daily_Return','sent_t','MktRet'])
+    if len(sub) < 30:
+        return {'Stock':stock, 'beta':np.nan, 'se':np.nan, 'p':np.nan, 'N':len(sub)}
+
+    X = sm.add_constant(sub[['Daily_Return','MktRet','sent_t']])  # ret_t, market_t, sentiment_t
+    y = sub['ret_t1']
+    m = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags':hac_lags})
+    return {
+        'Stock':stock,
+        'beta': float(m.params.get('sent_t', np.nan)),
+        'se':   float(m.bse.get('sent_t',   np.nan)),
+        'p':    float(m.pvalues.get('sent_t', np.nan)),
+        'N':    int(m.nobs)
+    }
+
+stocks_for_plots = top5 if len(top5)>0 else merged['Stock'].unique().tolist()[:5]
+l1_rows = [l1_with_controls(s, hac_lags=5) for s in stocks_for_plots]
+l1_tbl  = pd.DataFrame(l1_rows)
+print("\n[RQ2] Next-day (L=1) coefficient on sentiment_t WITH controls (ret_t, market_t) — HAC SE:")
+print(l1_tbl.round(6))
+
+ok = l1_tbl.dropna(subset=['beta','se'])
+if not ok.empty:
+    plt.figure(figsize=(7.6, 4.6))
+    ypos = np.arange(len(ok))[::-1]
+    plt.errorbar(ok['beta'], ypos, xerr=1.96*ok['se'], fmt='o', capsize=3)
+    plt.yticks(ypos, ok['Stock'])
+    plt.axvline(0, linestyle='--', linewidth=1)
+    plt.title("L=1 Next-day β on sentiment_t (WITH controls) — HAC 95% CI  (RQ2)")
+    plt.xlabel("Coefficient on sentiment_t in:  ret_{t+1} ~ ret_t + market_t + sentiment_t")
+    savefig("Panel_5_2a_L1_Controlled_Coef_Top5.png")
+    plt.show()
+else:
+    print("⚠️ [RQ2] Not enough data to plot controlled L=1 coefficients.")
+
+# =============================================================
+# RQ3 — Asymmetry visualization: β_pos vs β_neg (WITH controls)
+# Method: run the same controlled L=1 regression separately on
+#         positive-sentiment days and negative-sentiment days.
+# =============================================================
+def l1_controlled_subset(stock, sign='pos', hac_lags=5, eps=1e-12):
+    sub = merged[merged['Stock']==stock].copy().sort_values('DateOnly')
+    if sub.empty:
+        return {'Stock':stock, 'sign':sign, 'beta':np.nan, 'se':np.nan, 'p':np.nan, 'N':0}
+
+    mrk = merged.groupby('DateOnly')['Daily_Return'].mean().rename('MktRet')
+    sub = sub.merge(mrk, on='DateOnly', how='left')
+
+    sub['ret_t1'] = sub['Daily_Return'].shift(-1)
+    sub['sent_t'] = sub['sent_mean']
+
+    if sign == 'pos':
+        sub = sub[sub['sent_t'] > 0 + eps]
+    elif sign == 'neg':
+        sub = sub[sub['sent_t'] < 0 - eps]
+    else:
+        raise ValueError("sign must be 'pos' or 'neg'")
+
+    sub = sub.dropna(subset=['ret_t1','Daily_Return','sent_t','MktRet'])
+    if len(sub) < 25:
+        return {'Stock':stock, 'sign':sign, 'beta':np.nan, 'se':np.nan, 'p':np.nan, 'N':len(sub)}
+
+    X = sm.add_constant(sub[['Daily_Return','MktRet','sent_t']])
+    y = sub['ret_t1']
+    m = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags':hac_lags})
+    return {
+        'Stock':stock,
+        'sign':sign,
+        'beta': float(m.params.get('sent_t', np.nan)),
+        'se':   float(m.bse.get('sent_t',   np.nan)),
+        'p':    float(m.pvalues.get('sent_t', np.nan)),
+        'N':    int(m.nobs)
+    }
+
+asym_rows = []
+for s in stocks_for_plots:
+    asym_rows.append(l1_controlled_subset(s, 'pos', hac_lags=5))
+    asym_rows.append(l1_controlled_subset(s, 'neg', hac_lags=5))
+asym_tbl = pd.DataFrame(asym_rows)
+
+# Δ = β_neg − β_pos (per stock)
+delta_tbl = (
+    asym_tbl.pivot(index='Stock', columns='sign', values='beta')
+            .assign(Delta_neg_minus_pos=lambda d: d.get('neg') - d.get('pos'))
+            .reset_index()
+)
+
+print("\n[RQ3] Asymmetry (WITH controls) — β_pos vs β_neg (per stock):")
+print(asym_tbl.pivot(index='Stock', columns='sign', values=['beta','se','p','N']).round(6))
+print("\n[RQ3] Δ = β_neg − β_pos:")
+print(delta_tbl.round(6))
+
+# Plot: paired dots with HAC 95% CI
+ok = asym_tbl.dropna(subset=['beta','se'])
+if not ok.empty:
+    order = stocks_for_plots
+    pos_df = ok[ok['sign']=='pos'].set_index('Stock').reindex(order)
+    neg_df = ok[ok['sign']=='neg'].set_index('Stock').reindex(order)
+
+    plt.figure(figsize=(8.6, 5.0))
+    ypos = np.arange(len(order))[::-1]
+    # positive days
+    plt.errorbar(pos_df['beta'], ypos+0.12, xerr=1.96*pos_df['se'], fmt='o', capsize=3, label='β_pos (sent_t>0)')
+    # negative days
+    plt.errorbar(neg_df['beta'], ypos-0.12, xerr=1.96*neg_df['se'], fmt='o', capsize=3, label='β_neg (sent_t<0)')
+    plt.yticks(ypos, order)
+    plt.axvline(0, linestyle='--', linewidth=1)
+    plt.legend(loc='lower right', frameon=False)
+    plt.title("Asymmetry: β on sentiment_t by tone sign (WITH controls) — HAC 95% CI  (RQ3)")
+    plt.xlabel("Coefficient in:  ret_{t+1} ~ ret_t + market_t + sentiment_t   (subset by sign of sentiment_t)")
+    savefig("Panel_5_2b_Asymmetry_PosVsNeg_Controlled_Top5.png")
+    plt.show()
+else:
+    print("⚠️ [RQ3] Not enough data to plot asymmetry.")
+
+
+
+# =============================================================
 # Same-day OLS coefficients (HAC 95% CI)
 # =============================================================
 rows = []
